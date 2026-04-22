@@ -31,11 +31,11 @@ async function gitBranch(cwd: string): Promise<string> {
   }
 }
 
-async function gitLog(cwd: string, limit = 50, skip = 0): Promise<Commit[]> {
+async function gitLog(cwd: string, limit = 50, skip = 0, branch = 'HEAD'): Promise<Commit[]> {
   try {
     const format = '%H\x1f%h\x1f%s\x1f%an\x1f%ad\x1f%ar';
     const { stdout } = await execAsync(
-      `git log -${limit} --skip=${skip} --date=short --format="${format}"`,
+      `git log "${branch}" -${limit} --skip=${skip} --date=short --format="${format}"`,
       { cwd }
     );
     return stdout
@@ -46,6 +46,15 @@ async function gitLog(cwd: string, limit = 50, skip = 0): Promise<Commit[]> {
         const [hash, shortHash, subject, author, date, relativeDate] = line.split('\x1f');
         return { hash, shortHash, subject, author, date, relativeDate };
       });
+  } catch {
+    return [];
+  }
+}
+
+async function gitBranches(cwd: string): Promise<string[]> {
+  try {
+    const { stdout } = await execAsync('git branch --format="%(refname:short)"', { cwd });
+    return stdout.trim().split('\n').filter(Boolean);
   } catch {
     return [];
   }
@@ -149,7 +158,7 @@ class WorkspaceFoldersProvider implements vscode.TreeDataProvider<FolderItem> {
 
 // ─── Webview ─────────────────────────────────────────────────────────────────
 
-function buildWebview(folderName: string, branch: string, commits: Commit[]): string {
+function buildWebview(folderName: string, branch: string, commits: Commit[], branches: string[]): string {
   const commitRows = commits.length === 0
     ? '<tr><td colspan="5" class="empty">No commits found</td></tr>'
     : commits.map(c => `
@@ -178,16 +187,38 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
 
     h1 { font-size: 1.2em; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
 
-    .branch-pill {
-      display: inline-flex;
+    .branch-selector {
+      display: flex;
       align-items: center;
-      gap: 6px;
-      background: var(--vscode-badge-background);
-      color: var(--vscode-badge-foreground);
-      padding: 3px 10px;
-      border-radius: 999px;
-      font-size: 0.9em;
+      gap: 8px;
       margin-bottom: 20px;
+    }
+    .branch-selector select {
+      background: var(--vscode-dropdown-background);
+      color: var(--vscode-dropdown-foreground);
+      border: 1px solid var(--vscode-dropdown-border);
+      padding: 4px 8px;
+      font-family: inherit;
+      font-size: 0.9em;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .branch-selector button {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      border: none;
+      padding: 4px 10px;
+      font-family: inherit;
+      font-size: 0.85em;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .branch-selector button:hover:not(:disabled) {
+      background: var(--vscode-button-secondaryHoverBackground);
+    }
+    .branch-selector button:disabled {
+      opacity: 0.4;
+      cursor: default;
     }
 
     h2 { font-size: 1em; margin: 0 0 8px; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.05em; }
@@ -265,11 +296,11 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
 <body>
   <h1>📁 ${escHtml(folderName)}</h1>
 
-  <div class="branch-pill">
-    <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
-      <path d="M5 3.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0zm0 2.122a2.25 2.25 0 1 0-1.5 0v.878A2.25 2.25 0 0 0 5.75 8.5h1.5a.75.75 0 0 1 .75.75v.878a2.25 2.25 0 1 0 1.5 0V9.25A2.25 2.25 0 0 0 7.25 7h-1.5A.75.75 0 0 1 5 6.25v-.878zm4.75 7.378a.75.75 0 1 1-1.5 0 .75.75 0 0 0 1.5 0zM11.25 4a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5z"/>
-    </svg>
-    ${escHtml(branch)}
+  <div class="branch-selector">
+    <select id="branch-select">
+      ${branches.map(b => `<option value="${escHtml(b)}"${b === branch ? ' selected' : ''}>${b === branch ? '● ' : ''}${escHtml(b)}</option>`).join('')}
+    </select>
+    <button id="current-branch-btn" title="Switch to checked-out branch (${escHtml(branch)})">↩ Current</button>
   </div>
 
   <h2>Commit History</h2>
@@ -296,6 +327,13 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
     let offset = ${commits.length};
     let loadingMore = false;
     let exhausted = ${commits.length < 50};
+    const currentBranch = '${escHtml(branch)}';
+    let viewBranch = currentBranch;
+    let sentinelObserver = null;
+
+    function esc(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
 
     function renderRow(c) {
       return '<tr class="commit-row" data-hash="' + esc(c.hash) + '">' +
@@ -307,18 +345,46 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
         '</tr>';
     }
 
-    const sentinel = document.getElementById('load-sentinel');
-    if (sentinel) {
-      const observer = new IntersectionObserver(entries => {
+    function attachSentinelObserver() {
+      if (sentinelObserver) sentinelObserver.disconnect();
+      const s = document.getElementById('load-sentinel');
+      if (!s) return;
+      sentinelObserver = new IntersectionObserver(entries => {
         if (!entries[0].isIntersecting || loadingMore || exhausted) return;
         loadingMore = true;
-        vscode.postMessage({ type: 'loadMore', offset });
+        vscode.postMessage({ type: 'loadMore', offset, branch: viewBranch });
       }, { rootMargin: '120px' });
-      observer.observe(sentinel);
+      sentinelObserver.observe(s);
     }
+    attachSentinelObserver();
+
+    const branchSelect = document.getElementById('branch-select');
+    const currentBranchBtn = document.getElementById('current-branch-btn');
+
+    function updateCurrentBtn() {
+      currentBranchBtn.disabled = viewBranch === currentBranch;
+    }
+    updateCurrentBtn();
+
+    branchSelect.addEventListener('change', () => {
+      viewBranch = branchSelect.value;
+      updateCurrentBtn();
+      offset = 0;
+      loadingMore = false;
+      exhausted = false;
+      expandedHash = null;
+      pending.clear();
+      const tbody = document.querySelector('tbody');
+      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:14px;opacity:0.5;font-style:italic">Loading…</td></tr>';
+      vscode.postMessage({ type: 'changeBranch', branch: viewBranch });
+    });
+
+    currentBranchBtn.addEventListener('click', () => {
+      branchSelect.value = currentBranch;
+      branchSelect.dispatchEvent(new Event('change'));
+    });
 
     document.addEventListener('click', e => {
-      // file entry click — open diff view
       const fileEntry = e.target.closest('.file-entry');
       if (fileEntry) {
         e.stopPropagation();
@@ -332,7 +398,6 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
         return;
       }
 
-      // commit row click — expand / collapse file list
       const row = e.target.closest('tr.commit-row');
       if (!row) return;
 
@@ -369,21 +434,36 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
     });
 
     window.addEventListener('message', e => {
-      const { type, hash, files, commits: moreCommits } = e.data;
+      const { type, hash, files, commits: batch } = e.data;
+
+      if (type === 'branchCommits') {
+        if (e.data.branch !== viewBranch) return;
+        const tbody = document.querySelector('tbody');
+        if (!batch || batch.length === 0) {
+          exhausted = true;
+          tbody.innerHTML = '<tr><td colspan="5" class="empty">No commits found</td></tr>';
+          return;
+        }
+        offset = batch.length;
+        exhausted = batch.length < 50;
+        const sentinelHtml = exhausted ? '' : '<tr id="load-sentinel"><td colspan="5" style="text-align:center;padding:14px;opacity:0.45;font-style:italic">Loading more…</td></tr>';
+        tbody.innerHTML = batch.map(renderRow).join('') + sentinelHtml;
+        if (!exhausted) attachSentinelObserver();
+        return;
+      }
 
       if (type === 'moreCommits') {
+        if (e.data.branch !== viewBranch) return;
         loadingMore = false;
         const sentinel = document.getElementById('load-sentinel');
-        if (!moreCommits || moreCommits.length === 0) {
+        if (!batch || batch.length === 0) {
           exhausted = true;
           if (sentinel) sentinel.remove();
           return;
         }
-        offset += moreCommits.length;
-        if (sentinel) {
-          sentinel.insertAdjacentHTML('beforebegin', moreCommits.map(renderRow).join(''));
-        }
-        if (moreCommits.length < 50) {
+        offset += batch.length;
+        if (sentinel) sentinel.insertAdjacentHTML('beforebegin', batch.map(renderRow).join(''));
+        if (batch.length < 50) {
           exhausted = true;
           if (sentinel) sentinel.remove();
         }
@@ -414,10 +494,6 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
         '</span>'
       ).join('');
     });
-
-    function esc(s) {
-      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    }
   </script>
 </body>
 </html>`;
@@ -456,19 +532,27 @@ export function activate(context: vscode.ExtensionContext): void {
           { enableScripts: true, retainContextWhenHidden: true }
         );
 
-        panel.webview.html = buildWebview(folderName, 'Loading…', []);
+        panel.webview.html = buildWebview(folderName, 'Loading…', [], []);
 
-        const [branch, commits] = await Promise.all([
+        const [branch, commits, branches] = await Promise.all([
           gitBranch(folderPath),
           gitLog(folderPath),
+          gitBranches(folderPath),
         ]);
 
-        panel.webview.html = buildWebview(folderName, branch, commits);
+        panel.webview.html = buildWebview(folderName, branch, commits, branches);
 
         panel.webview.onDidReceiveMessage(async msg => {
+          if (msg.type === 'changeBranch') {
+            const commits = await gitLog(folderPath, 50, 0, msg.branch);
+            panel.webview.postMessage({ type: 'branchCommits', commits, branch: msg.branch });
+            return;
+          }
+
           if (msg.type === 'loadMore') {
-            const commits = await gitLog(folderPath, 50, msg.offset);
-            panel.webview.postMessage({ type: 'moreCommits', commits });
+            const b = msg.branch ?? branch;
+            const commits = await gitLog(folderPath, 50, msg.offset, b);
+            panel.webview.postMessage({ type: 'moreCommits', commits, branch: b });
             return;
           }
 
