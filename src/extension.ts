@@ -14,8 +14,10 @@ interface Commit {
 }
 
 interface ChangedFile {
-  status: string;
-  file: string;
+  status: string;   // A, M, D, R, C
+  file: string;     // display label: "path" or "old → new"
+  oldPath: string;  // path at parent commit (before)
+  newPath: string;  // path at this commit (after)
 }
 
 // ─── Git helpers ────────────────────────────────────────────────────────────
@@ -63,16 +65,46 @@ async function gitFilesChanged(cwd: string, hash: string): Promise<ChangedFile[]
         const parts = line.split('\t');
         const rawStatus = parts[0].trim();
         const status = rawStatus[0]; // R100 → R, C090 → C
-        const file =
-          status === 'R' || status === 'C'
-            ? `${parts[1]} → ${parts[2]}`
-            : (parts[1] ?? '');
-        return { status, file };
+        if (status === 'R' || status === 'C') {
+          const oldPath = parts[1] ?? '';
+          const newPath = parts[2] ?? '';
+          return { status, file: `${oldPath} → ${newPath}`, oldPath, newPath };
+        }
+        const p = parts[1] ?? '';
+        return { status, file: p, oldPath: p, newPath: p };
       });
   } catch {
     return [];
   }
 }
+
+// ─── Git content provider ────────────────────────────────────────────────────
+
+class GitShowProvider implements vscode.TextDocumentContentProvider {
+  static readonly scheme = 'gitshow';
+
+  async provideTextDocumentContent(uri: vscode.Uri): Promise<string> {
+    const params   = new URLSearchParams(uri.query);
+    const ref      = params.get('ref')  ?? '';
+    const filePath = params.get('file') ?? '';
+    const cwd      = params.get('cwd')  ?? '';
+    if (!ref || !filePath || !cwd) return '';
+    try {
+      const { stdout } = await execAsync(`git show "${ref}:${filePath}"`, { cwd });
+      return stdout;
+    } catch {
+      return ''; // initial commit has no parent; added/deleted edge cases
+    }
+  }
+}
+
+function makeGitShowUri(ref: string, filePath: string, cwd: string): vscode.Uri {
+  const safePath = filePath.replace(/\//g, '%2F');
+  const query = `ref=${encodeURIComponent(ref)}&file=${encodeURIComponent(filePath)}&cwd=${encodeURIComponent(cwd)}`;
+  return vscode.Uri.from({ scheme: GitShowProvider.scheme, path: `/${ref}/${safePath}`, query });
+}
+
+const EMPTY_URI = vscode.Uri.from({ scheme: GitShowProvider.scheme, path: '/empty' });
 
 // ─── Tree view ───────────────────────────────────────────────────────────────
 
@@ -208,7 +240,12 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
       padding: 8px 12px 10px 32px;
     }
     .file-list.loading { opacity: 0.5; font-style: italic; }
-    .file-entry { display: flex; align-items: baseline; gap: 5px; font-size: 0.88em; white-space: nowrap; }
+    .file-entry {
+      display: flex; align-items: baseline; gap: 5px;
+      font-size: 0.88em; white-space: nowrap;
+      cursor: pointer;
+    }
+    .file-entry:hover .file-name { text-decoration: underline; opacity: 1; }
     .file-status {
       font-family: var(--vscode-editor-font-family, monospace);
       font-weight: 700;
@@ -256,6 +293,21 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
     const pending = new Set();
 
     document.addEventListener('click', e => {
+      // file entry click — open diff view
+      const fileEntry = e.target.closest('.file-entry');
+      if (fileEntry) {
+        e.stopPropagation();
+        vscode.postMessage({
+          type:    'openDiff',
+          hash:    fileEntry.dataset.hash,
+          status:  fileEntry.dataset.status,
+          oldPath: fileEntry.dataset.oldPath,
+          newPath: fileEntry.dataset.newPath,
+        });
+        return;
+      }
+
+      // commit row click — expand / collapse file list
       const row = e.target.closest('tr.commit-row');
       if (!row) return;
 
@@ -297,7 +349,12 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
       }
       fileList.classList.remove('loading');
       fileList.innerHTML = files.map(f =>
-        '<span class="file-entry">' +
+        '<span class="file-entry"' +
+          ' data-hash="'     + esc(hash)        + '"' +
+          ' data-status="'   + esc(f.status)    + '"' +
+          ' data-old-path="' + esc(f.oldPath)   + '"' +
+          ' data-new-path="' + esc(f.newPath)   + '"' +
+        '>' +
           '<span class="file-status s-' + esc(f.status) + '">' + esc(f.status) + '</span>' +
           '<span class="file-name">' + esc(f.file) + '</span>' +
         '</span>'
@@ -326,6 +383,11 @@ export function activate(context: vscode.ExtensionContext): void {
   const provider = new WorkspaceFoldersProvider();
 
   context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider(
+      GitShowProvider.scheme,
+      new GitShowProvider()
+    ),
+
     vscode.window.registerTreeDataProvider('gitWorkspaceExplorer.folders', provider),
 
     vscode.commands.registerCommand('gitWorkspaceExplorer.refresh', () => provider.refresh()),
@@ -350,9 +412,45 @@ export function activate(context: vscode.ExtensionContext): void {
         panel.webview.html = buildWebview(folderName, branch, commits);
 
         panel.webview.onDidReceiveMessage(async msg => {
-          if (msg.type !== 'getFiles') return;
-          const files = await gitFilesChanged(folderPath, msg.hash);
-          panel.webview.postMessage({ type: 'commitFiles', hash: msg.hash, files });
+          if (msg.type === 'getFiles') {
+            const files = await gitFilesChanged(folderPath, msg.hash);
+            panel.webview.postMessage({ type: 'commitFiles', hash: msg.hash, files });
+            return;
+          }
+
+          if (msg.type === 'openDiff') {
+            const { hash, status, oldPath, newPath } = msg as {
+              hash: string; status: string; oldPath: string; newPath: string;
+            };
+            const shortHash = hash.slice(0, 7);
+            let leftUri: vscode.Uri;
+            let rightUri: vscode.Uri;
+            let title: string;
+
+            switch (status) {
+              case 'A':
+                leftUri  = EMPTY_URI;
+                rightUri = makeGitShowUri(hash, newPath, folderPath);
+                title    = `${newPath} (added)`;
+                break;
+              case 'D':
+                leftUri  = makeGitShowUri(`${hash}^`, oldPath, folderPath);
+                rightUri = EMPTY_URI;
+                title    = `${oldPath} (deleted)`;
+                break;
+              case 'R':
+                leftUri  = makeGitShowUri(`${hash}^`, oldPath, folderPath);
+                rightUri = makeGitShowUri(hash, newPath, folderPath);
+                title    = `${oldPath} → ${newPath} (renamed @ ${shortHash})`;
+                break;
+              default: // M, C
+                leftUri  = makeGitShowUri(`${hash}^`, oldPath, folderPath);
+                rightUri = makeGitShowUri(hash, newPath, folderPath);
+                title    = `${newPath} (${shortHash})`;
+            }
+
+            await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, title);
+          }
         });
       }
     ),
