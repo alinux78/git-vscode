@@ -60,6 +60,51 @@ async function gitBranches(cwd: string): Promise<string[]> {
   }
 }
 
+async function gitSearchCommits(
+  cwd: string,
+  query: string,
+  branch: string
+): Promise<Array<{ hash: string; skip: number }>> {
+  const q = query.replace(/["\\]/g, '\\$&');
+  const run = (cmd: string): Promise<string[]> =>
+    execAsync(cmd, { cwd })
+      .then(r => r.stdout.trim().split('\n').filter(Boolean))
+      .catch(() => []);
+
+  const [byMsg, byAuthor] = await Promise.all([
+    run(`git log "${branch}" -i --grep="${q}" --format="%H"`),
+    run(`git log "${branch}" -i --author="${q}" --format="%H"`),
+  ]);
+
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const h of [...byMsg, ...byAuthor]) {
+    if (!seen.has(h)) { seen.add(h); merged.push(h); }
+  }
+
+  if (/^[0-9a-f]{4,}$/i.test(query)) {
+    try {
+      const { stdout } = await execAsync(`git rev-parse --verify "${query}"`, { cwd });
+      const h = stdout.trim();
+      if (h.length === 40 && !seen.has(h)) { seen.add(h); merged.push(h); }
+    } catch {}
+  }
+
+  if (merged.length === 0) return [];
+
+  const results = await Promise.all(
+    merged.map(async hash => {
+      try {
+        const { stdout } = await execAsync(`git rev-list --count "${branch}" ^"${hash}"`, { cwd });
+        return { hash, skip: parseInt(stdout.trim(), 10) };
+      } catch { return null; }
+    })
+  );
+
+  return (results.filter((r): r is { hash: string; skip: number } => r !== null))
+    .sort((a, b) => a.skip - b.skip);
+}
+
 async function gitFilesChanged(cwd: string, hash: string): Promise<ChangedFile[]> {
   try {
     const { stdout } = await execAsync(
@@ -183,7 +228,7 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
       color: var(--vscode-foreground);
       background: var(--vscode-editor-background);
     }
-    body { margin: 0; padding: 16px; }
+    body { margin: 0; padding: 16px; padding-bottom: 52px; }
 
     h1 { font-size: 1.2em; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
 
@@ -291,6 +336,48 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
     .s-C { color: #bc8cff; }
     .file-name { opacity: 0.9; }
     .no-files { opacity: 0.5; font-style: italic; }
+
+    .search-bar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 16px;
+      background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+      border-top: 1px solid var(--vscode-panel-border);
+      z-index: 10;
+    }
+    .search-bar input {
+      flex: 1;
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      border: 1px solid var(--vscode-input-border, transparent);
+      padding: 4px 8px;
+      font-family: inherit;
+      font-size: 0.9em;
+      border-radius: 4px;
+      outline: none;
+    }
+    .search-bar input:focus { border-color: var(--vscode-focusBorder); }
+    .search-bar button {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      border: none;
+      padding: 4px 10px;
+      font-family: inherit;
+      font-size: 0.85em;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .search-bar button:hover:not(:disabled) { background: var(--vscode-button-secondaryHoverBackground); }
+    .search-bar button:disabled { opacity: 0.4; cursor: default; }
+    .search-count { font-size: 0.85em; opacity: 0.7; white-space: nowrap; min-width: 56px; }
+    .commit-row.match { background: var(--vscode-editor-findMatchHighlightBackground, rgba(255,200,0,0.18)); }
+    .commit-row.current-match { background: var(--vscode-editor-findMatchBackground, rgba(255,140,0,0.45)) !important;
+                                outline: 1px solid var(--vscode-editor-findMatchBorder, rgba(255,140,0,0.9)); }
   </style>
 </head>
 <body>
@@ -320,6 +407,14 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
     </tbody>
   </table>
 
+  <div class="search-bar">
+    <input id="search-input" type="text" placeholder="Search hash, message, author…" />
+    <button id="search-btn">Search</button>
+    <button id="search-prev" title="Previous match" disabled>↑</button>
+    <button id="search-next" title="Next match" disabled>↓</button>
+    <span class="search-count" id="search-count"></span>
+  </div>
+
   <script>
     const vscode = acquireVsCodeApi();
     const pending = new Set();
@@ -330,6 +425,8 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
     const currentBranch = '${escHtml(branch)}';
     let viewBranch = currentBranch;
     let sentinelObserver = null;
+    let searchResults = [];
+    let searchResultIdx = -1;
 
     function esc(s) {
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -374,6 +471,7 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
       exhausted = false;
       expandedHash = null;
       pending.clear();
+      clearSearch();
       const tbody = document.querySelector('tbody');
       tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:14px;opacity:0.5;font-style:italic">Loading…</td></tr>';
       vscode.postMessage({ type: 'changeBranch', branch: viewBranch });
@@ -436,6 +534,33 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
     window.addEventListener('message', e => {
       const { type, hash, files, commits: batch } = e.data;
 
+      if (type === 'searchResults') {
+        if (e.data.branch !== viewBranch) return;
+        searchResults = e.data.results ?? [];
+        if (searchResults.length === 0) { searchCount.textContent = 'No matches'; return; }
+        searchPrev.disabled = false;
+        searchNext.disabled = false;
+        goToMatch(0);
+        return;
+      }
+
+      if (type === 'windowCommits') {
+        if (e.data.branch !== viewBranch) return;
+        const { commits: batch, windowSkip, anchor } = e.data;
+        const tbody = document.querySelector('tbody');
+        offset = windowSkip + (batch?.length ?? 0);
+        exhausted = (batch?.length ?? 0) < 50;
+        const sentinelHtml = exhausted ? '' : '<tr id="load-sentinel"><td colspan="5" style="text-align:center;padding:14px;opacity:0.45;font-style:italic">Loading more…</td></tr>';
+        tbody.innerHTML = (batch ?? []).map(renderRow).join('') + sentinelHtml;
+        if (!exhausted) attachSentinelObserver();
+        const anchorRow = document.querySelector('tr.commit-row[data-hash="' + esc(anchor) + '"]');
+        if (anchorRow) {
+          anchorRow.classList.add('current-match');
+          anchorRow.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        }
+        return;
+      }
+
       if (type === 'branchCommits') {
         if (e.data.branch !== viewBranch) return;
         const tbody = document.querySelector('tbody');
@@ -494,6 +619,51 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
         '</span>'
       ).join('');
     });
+
+    const searchInput = document.getElementById('search-input');
+    const searchBtn   = document.getElementById('search-btn');
+    const searchPrev  = document.getElementById('search-prev');
+    const searchNext  = document.getElementById('search-next');
+    const searchCount = document.getElementById('search-count');
+
+    function clearSearch() {
+      document.querySelectorAll('tr.commit-row.current-match').forEach(r =>
+        r.classList.remove('current-match')
+      );
+      searchResults = [];
+      searchResultIdx = -1;
+      searchCount.textContent = '';
+      searchPrev.disabled = true;
+      searchNext.disabled = true;
+    }
+
+    function doSearch() {
+      clearSearch();
+      const q = searchInput.value.trim();
+      if (!q) return;
+      searchCount.textContent = 'Searching…';
+      vscode.postMessage({ type: 'search', query: q, branch: viewBranch });
+    }
+
+    function goToMatch(idx) {
+      if (searchResults.length === 0) return;
+      document.querySelectorAll('tr.commit-row.current-match').forEach(r => r.classList.remove('current-match'));
+      searchResultIdx = ((idx % searchResults.length) + searchResults.length) % searchResults.length;
+      searchCount.textContent = (searchResultIdx + 1) + ' / ' + searchResults.length;
+      const { hash, skip } = searchResults[searchResultIdx];
+      const row = document.querySelector('tr.commit-row[data-hash="' + esc(hash) + '"]');
+      if (row) {
+        row.classList.add('current-match');
+        row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      } else {
+        vscode.postMessage({ type: 'loadWindow', skip: Math.max(0, skip - 24), branch: viewBranch, anchor: hash });
+      }
+    }
+
+    searchBtn.addEventListener('click', doSearch);
+    searchInput.addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
+    searchPrev.addEventListener('click', () => goToMatch(searchResultIdx - 1));
+    searchNext.addEventListener('click', () => goToMatch(searchResultIdx + 1));
   </script>
 </body>
 </html>`;
@@ -543,6 +713,20 @@ export function activate(context: vscode.ExtensionContext): void {
         panel.webview.html = buildWebview(folderName, branch, commits, branches);
 
         panel.webview.onDidReceiveMessage(async msg => {
+          if (msg.type === 'search') {
+            const b = msg.branch ?? branch;
+            const results = await gitSearchCommits(folderPath, msg.query, b);
+            panel.webview.postMessage({ type: 'searchResults', results, branch: b });
+            return;
+          }
+
+          if (msg.type === 'loadWindow') {
+            const b = msg.branch ?? branch;
+            const commits = await gitLog(folderPath, 50, msg.skip, b);
+            panel.webview.postMessage({ type: 'windowCommits', commits, windowSkip: msg.skip, branch: b, anchor: msg.anchor });
+            return;
+          }
+
           if (msg.type === 'changeBranch') {
             const commits = await gitLog(folderPath, 50, 0, msg.branch);
             panel.webview.postMessage({ type: 'branchCommits', commits, branch: msg.branch });
