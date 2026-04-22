@@ -499,10 +499,13 @@ export function activate(context: vscode.ExtensionContext): void {
                 title    = `${newPath} (${shortHash})`;
             }
 
-            await vscode.workspace
-              .getConfiguration('diffEditor')
-              .update('renderSideBySide', true, vscode.ConfigurationTarget.Global);
-            await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, title);
+            await Promise.all([
+              vscode.workspace.getConfiguration('diffEditor')
+                .update('renderSideBySide', true, vscode.ConfigurationTarget.Global),
+              vscode.workspace.getConfiguration('workbench.editor')
+                .update('openSideBySideDirection', 'down', vscode.ConfigurationTarget.Global),
+            ]);
+            await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, title, { viewColumn: vscode.ViewColumn.Beside });
           }
         });
       }
