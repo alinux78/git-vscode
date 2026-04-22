@@ -449,7 +449,10 @@ export function activate(context: vscode.ExtensionContext): void {
                 title    = `${newPath} (${shortHash})`;
             }
 
-            await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, title, { renderSideBySide: true });
+            await vscode.workspace
+              .getConfiguration('diffEditor')
+              .update('renderSideBySide', true, vscode.ConfigurationTarget.Global);
+            await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, title);
           }
         });
       }
