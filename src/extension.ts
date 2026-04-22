@@ -31,11 +31,11 @@ async function gitBranch(cwd: string): Promise<string> {
   }
 }
 
-async function gitLog(cwd: string, limit = 50): Promise<Commit[]> {
+async function gitLog(cwd: string, limit = 50, skip = 0): Promise<Commit[]> {
   try {
     const format = '%H\x1f%h\x1f%s\x1f%an\x1f%ad\x1f%ar';
     const { stdout } = await execAsync(
-      `git log -${limit} --date=short --format="${format}"`,
+      `git log -${limit} --skip=${skip} --date=short --format="${format}"`,
       { cwd }
     );
     return stdout
@@ -285,12 +285,36 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
     </thead>
     <tbody>
       ${commitRows}
+      ${commits.length === 50 ? '<tr id="load-sentinel"><td colspan="5" style="text-align:center;padding:14px;opacity:0.45;font-style:italic">Loading more…</td></tr>' : ''}
     </tbody>
   </table>
 
   <script>
     const vscode = acquireVsCodeApi();
     const pending = new Set();
+    let offset = ${commits.length};
+    let loadingMore = false;
+    let exhausted = ${commits.length < 50};
+
+    function renderRow(c) {
+      return '<tr class="commit-row" data-hash="' + esc(c.hash) + '">' +
+        '<td class="arrow">▶</td>' +
+        '<td class="hash" title="' + esc(c.hash) + '">' + esc(c.shortHash) + '</td>' +
+        '<td class="subject">' + esc(c.subject) + '</td>' +
+        '<td class="author">' + esc(c.author) + '</td>' +
+        '<td class="date" title="' + esc(c.date) + '">' + esc(c.relativeDate) + '</td>' +
+        '</tr>';
+    }
+
+    const sentinel = document.getElementById('load-sentinel');
+    if (sentinel) {
+      const observer = new IntersectionObserver(entries => {
+        if (!entries[0].isIntersecting || loadingMore || exhausted) return;
+        loadingMore = true;
+        vscode.postMessage({ type: 'loadMore', offset });
+      }, { rootMargin: '120px' });
+      observer.observe(sentinel);
+    }
 
     document.addEventListener('click', e => {
       // file entry click — open diff view
@@ -335,7 +359,27 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
     });
 
     window.addEventListener('message', e => {
-      const { type, hash, files } = e.data;
+      const { type, hash, files, commits: moreCommits } = e.data;
+
+      if (type === 'moreCommits') {
+        loadingMore = false;
+        const sentinel = document.getElementById('load-sentinel');
+        if (!moreCommits || moreCommits.length === 0) {
+          exhausted = true;
+          if (sentinel) sentinel.remove();
+          return;
+        }
+        offset += moreCommits.length;
+        if (sentinel) {
+          sentinel.insertAdjacentHTML('beforebegin', moreCommits.map(renderRow).join(''));
+        }
+        if (moreCommits.length < 50) {
+          exhausted = true;
+          if (sentinel) sentinel.remove();
+        }
+        return;
+      }
+
       if (type !== 'commitFiles') return;
       pending.delete(hash);
 
@@ -412,6 +456,12 @@ export function activate(context: vscode.ExtensionContext): void {
         panel.webview.html = buildWebview(folderName, branch, commits);
 
         panel.webview.onDidReceiveMessage(async msg => {
+          if (msg.type === 'loadMore') {
+            const commits = await gitLog(folderPath, 50, msg.offset);
+            panel.webview.postMessage({ type: 'moreCommits', commits });
+            return;
+          }
+
           if (msg.type === 'getFiles') {
             const files = await gitFilesChanged(folderPath, msg.hash);
             panel.webview.postMessage({ type: 'commitFiles', hash: msg.hash, files });
