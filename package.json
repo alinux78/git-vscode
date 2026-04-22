@@ -1,0 +1,59 @@
+{
+  "name": "git-workspace-explorer",
+  "displayName": "Git Workspace Explorer",
+  "description": "Lists top-level workspace folders and shows git branch/commit history",
+  "version": "0.0.1",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["SCM Providers"],
+  "activationEvents": ["onView:gitWorkspaceExplorer.folders"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "gitWorkspaceExplorer",
+          "title": "Git Workspace",
+          "icon": "media/git-branch.svg"
+        }
+      ]
+    },
+    "views": {
+      "gitWorkspaceExplorer": [
+        {
+          "id": "gitWorkspaceExplorer.folders",
+          "name": "Workspace Folders"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "gitWorkspaceExplorer.showGitInfo",
+        "title": "Show Git Info"
+      },
+      {
+        "command": "gitWorkspaceExplorer.refresh",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "gitWorkspaceExplorer.refresh",
+          "when": "view == gitWorkspaceExplorer.folders",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}
