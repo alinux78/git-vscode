@@ -13,6 +13,11 @@ interface Commit {
   relativeDate: string;
 }
 
+interface ChangedFile {
+  status: string;
+  file: string;
+}
+
 // ─── Git helpers ────────────────────────────────────────────────────────────
 
 async function gitBranch(cwd: string): Promise<string> {
@@ -38,6 +43,31 @@ async function gitLog(cwd: string, limit = 50): Promise<Commit[]> {
       .map(line => {
         const [hash, shortHash, subject, author, date, relativeDate] = line.split('\x1f');
         return { hash, shortHash, subject, author, date, relativeDate };
+      });
+  } catch {
+    return [];
+  }
+}
+
+async function gitFilesChanged(cwd: string, hash: string): Promise<ChangedFile[]> {
+  try {
+    const { stdout } = await execAsync(
+      `git diff-tree --no-commit-id -r --name-status ${hash}`,
+      { cwd }
+    );
+    return stdout
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map(line => {
+        const parts = line.split('\t');
+        const rawStatus = parts[0].trim();
+        const status = rawStatus[0]; // R100 → R, C090 → C
+        const file =
+          status === 'R' || status === 'C'
+            ? `${parts[1]} → ${parts[2]}`
+            : (parts[1] ?? '');
+        return { status, file };
       });
   } catch {
     return [];
@@ -89,9 +119,10 @@ class WorkspaceFoldersProvider implements vscode.TreeDataProvider<FolderItem> {
 
 function buildWebview(folderName: string, branch: string, commits: Commit[]): string {
   const commitRows = commits.length === 0
-    ? '<tr><td colspan="4" class="empty">No commits found</td></tr>'
+    ? '<tr><td colspan="5" class="empty">No commits found</td></tr>'
     : commits.map(c => `
-        <tr>
+        <tr class="commit-row" data-hash="${escHtml(c.hash)}">
+          <td class="arrow">▶</td>
           <td class="hash" title="${escHtml(c.hash)}">${escHtml(c.shortHash)}</td>
           <td class="subject">${escHtml(c.subject)}</td>
           <td class="author">${escHtml(c.author)}</td>
@@ -106,7 +137,6 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
   <title>Git: ${escHtml(folderName)}</title>
   <style>
     :root {
-      --radius: 6px;
       font-family: var(--vscode-font-family);
       font-size: var(--vscode-font-size);
       color: var(--vscode-foreground);
@@ -115,7 +145,6 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
     body { margin: 0; padding: 16px; }
 
     h1 { font-size: 1.2em; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
-    h1 .folder-icon { opacity: 0.7; }
 
     .branch-pill {
       display: inline-flex;
@@ -143,26 +172,65 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
       letter-spacing: 0.04em;
     }
     tbody tr { transition: background 0.1s; }
-    tbody tr:hover { background: var(--vscode-list-hoverBackground); }
+
+    .commit-row { cursor: pointer; }
+    .commit-row:hover { background: var(--vscode-list-hoverBackground); }
+    .commit-row.expanded { background: var(--vscode-list-activeSelectionBackground);
+                           color: var(--vscode-list-activeSelectionForeground); }
+    .commit-row.expanded td { border-bottom: none; }
+
     tbody td { padding: 5px 8px; border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.15)); vertical-align: top; }
+
+    .arrow { width: 16px; text-align: center; font-size: 0.7em; opacity: 0.5; transition: transform 0.15s; user-select: none; }
+    .commit-row.expanded .arrow { transform: rotate(90deg); opacity: 1; }
 
     .hash {
       font-family: var(--vscode-editor-font-family, monospace);
       color: var(--vscode-textLink-foreground);
       white-space: nowrap;
     }
-    .subject { width: 55%; }
+    .commit-row.expanded .hash { color: inherit; }
+    .subject { width: 52%; }
     .author { white-space: nowrap; opacity: 0.8; }
     .date   { white-space: nowrap; opacity: 0.7; text-align: right; }
     .empty  { text-align: center; padding: 24px; opacity: 0.5; }
+
+    /* detail row */
+    .detail-row td {
+      padding: 0;
+      border-bottom: 2px solid var(--vscode-panel-border);
+      background: var(--vscode-editor-background);
+    }
+    .file-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px 16px;
+      padding: 8px 12px 10px 32px;
+    }
+    .file-list.loading { opacity: 0.5; font-style: italic; }
+    .file-entry { display: flex; align-items: baseline; gap: 5px; font-size: 0.88em; white-space: nowrap; }
+    .file-status {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-weight: 700;
+      font-size: 0.8em;
+      width: 14px;
+      text-align: center;
+    }
+    .s-A { color: #3fb950; }
+    .s-M { color: #d29922; }
+    .s-D { color: #f85149; }
+    .s-R { color: #58a6ff; }
+    .s-C { color: #bc8cff; }
+    .file-name { opacity: 0.9; }
+    .no-files { opacity: 0.5; font-style: italic; }
   </style>
 </head>
 <body>
-  <h1><span class="folder-icon">📁</span>${escHtml(folderName)}</h1>
+  <h1>📁 ${escHtml(folderName)}</h1>
 
   <div class="branch-pill">
     <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
-      <path d="M5 3.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0zm0 2.122a2.25 2.25 0 1 0-1.5 0v.878A2.25 2.25 0 0 0 5.75 8.5h1.5a.75.75 0 0 1 .75.75v.878a2.25 2.25 0 1 0 1.5 0V9.25A2.25 2.25 0 0 0 7.25 7h-1.5A.75.75 0 0 1 5 6.25v-.878zm4.75 7.378a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0zM11.25 4a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5z"/>
+      <path d="M5 3.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0zm0 2.122a2.25 2.25 0 1 0-1.5 0v.878A2.25 2.25 0 0 0 5.75 8.5h1.5a.75.75 0 0 1 .75.75v.878a2.25 2.25 0 1 0 1.5 0V9.25A2.25 2.25 0 0 0 7.25 7h-1.5A.75.75 0 0 1 5 6.25v-.878zm4.75 7.378a.75.75 0 1 1-1.5 0 .75.75 0 0 0 1.5 0zM11.25 4a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5z"/>
     </svg>
     ${escHtml(branch)}
   </div>
@@ -171,6 +239,7 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
   <table>
     <thead>
       <tr>
+        <th></th>
         <th>Hash</th>
         <th>Message</th>
         <th>Author</th>
@@ -181,6 +250,64 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
       ${commitRows}
     </tbody>
   </table>
+
+  <script>
+    const vscode = acquireVsCodeApi();
+    const pending = new Set();
+
+    document.addEventListener('click', e => {
+      const row = e.target.closest('tr.commit-row');
+      if (!row) return;
+
+      const hash = row.dataset.hash;
+      const detailId = 'detail-' + hash;
+      const existing = document.getElementById(detailId);
+
+      if (existing) {
+        existing.remove();
+        row.classList.remove('expanded');
+        return;
+      }
+
+      if (pending.has(hash)) return;
+      pending.add(hash);
+      row.classList.add('expanded');
+
+      const loadRow = document.createElement('tr');
+      loadRow.id = detailId;
+      loadRow.className = 'detail-row';
+      loadRow.innerHTML = '<td colspan="5"><div class="file-list loading">Loading…</div></td>';
+      row.insertAdjacentElement('afterend', loadRow);
+
+      vscode.postMessage({ type: 'getFiles', hash });
+    });
+
+    window.addEventListener('message', e => {
+      const { type, hash, files } = e.data;
+      if (type !== 'commitFiles') return;
+      pending.delete(hash);
+
+      const detailRow = document.getElementById('detail-' + hash);
+      if (!detailRow) return;
+
+      const fileList = detailRow.querySelector('.file-list');
+      if (files.length === 0) {
+        fileList.innerHTML = '<span class="no-files">No files changed</span>';
+        return;
+      }
+      fileList.classList.remove('loading');
+      fileList.innerHTML = files.map(f =>
+        '<span class="file-entry">' +
+          '<span class="file-status s-' + esc(f.status) + '">' + esc(f.status) + '</span>' +
+          '<span class="file-name">' + esc(f.file) + '</span>' +
+        '</span>'
+      ).join('');
+    });
+
+    function esc(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+  </script>
 </body>
 </html>`;
 }
@@ -210,7 +337,7 @@ export function activate(context: vscode.ExtensionContext): void {
           'gitWorkspaceExplorer.info',
           `Git: ${folderName}`,
           vscode.ViewColumn.One,
-          { enableScripts: false }
+          { enableScripts: true }
         );
 
         panel.webview.html = buildWebview(folderName, 'Loading…', []);
@@ -221,10 +348,15 @@ export function activate(context: vscode.ExtensionContext): void {
         ]);
 
         panel.webview.html = buildWebview(folderName, branch, commits);
+
+        panel.webview.onDidReceiveMessage(async msg => {
+          if (msg.type !== 'getFiles') return;
+          const files = await gitFilesChanged(folderPath, msg.hash);
+          panel.webview.postMessage({ type: 'commitFiles', hash: msg.hash, files });
+        });
       }
     ),
 
-    // Refresh tree when workspace folders change
     vscode.workspace.onDidChangeWorkspaceFolders(() => provider.refresh())
   );
 }
