@@ -399,7 +399,7 @@ export function activate(context: vscode.ExtensionContext): void {
           'gitWorkspaceExplorer.info',
           `Git: ${folderName}`,
           vscode.ViewColumn.One,
-          { enableScripts: true }
+          { enableScripts: true, retainContextWhenHidden: true }
         );
 
         panel.webview.html = buildWebview(folderName, 'Loading…', []);
