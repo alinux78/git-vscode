@@ -292,6 +292,7 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
   <script>
     const vscode = acquireVsCodeApi();
     const pending = new Set();
+    let expandedHash = null;
     let offset = ${commits.length};
     let loadingMore = false;
     let exhausted = ${commits.length < 50};
@@ -342,12 +343,21 @@ function buildWebview(folderName: string, branch: string, commits: Commit[]): st
       if (existing) {
         existing.remove();
         row.classList.remove('expanded');
+        expandedHash = null;
         return;
+      }
+
+      if (expandedHash && expandedHash !== hash) {
+        const prevDetail = document.getElementById('detail-' + expandedHash);
+        if (prevDetail) prevDetail.remove();
+        const prevRow = document.querySelector('tr.commit-row[data-hash="' + expandedHash + '"]');
+        if (prevRow) prevRow.classList.remove('expanded');
       }
 
       if (pending.has(hash)) return;
       pending.add(hash);
       row.classList.add('expanded');
+      expandedHash = hash;
 
       const loadRow = document.createElement('tr');
       loadRow.id = detailId;
