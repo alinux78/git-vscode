@@ -1016,6 +1016,33 @@ function escHtml(s: string): string {
     .replace(/"/g, '&quot;');
 }
 
+// ─── Diff helpers ────────────────────────────────────────────────────────────
+
+function diffViewColumn(): vscode.ViewColumn {
+  for (const group of vscode.window.tabGroups.all) {
+    for (const tab of group.tabs) {
+      if (tab.input instanceof vscode.TabInputTextDiff) {
+        const { original, modified } = tab.input as vscode.TabInputTextDiff;
+        if (original.scheme === GitShowProvider.scheme ||
+            modified.scheme === GitShowProvider.scheme) {
+          return group.viewColumn;
+        }
+      }
+    }
+  }
+  return vscode.ViewColumn.Beside;
+}
+
+async function openDiffEditor(left: vscode.Uri, right: vscode.Uri, title: string): Promise<void> {
+  await Promise.all([
+    vscode.workspace.getConfiguration('diffEditor')
+      .update('renderSideBySide', true, vscode.ConfigurationTarget.Global),
+    vscode.workspace.getConfiguration('workbench.editor')
+      .update('openSideBySideDirection', 'down', vscode.ConfigurationTarget.Global),
+  ]);
+  await vscode.commands.executeCommand('vscode.diff', left, right, title, { viewColumn: diffViewColumn() });
+}
+
 // ─── Activation ───────────────────────────────────────────────────────────────
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -1176,13 +1203,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
               }
             }
 
-            await Promise.all([
-              vscode.workspace.getConfiguration('diffEditor')
-                .update('renderSideBySide', true, vscode.ConfigurationTarget.Global),
-              vscode.workspace.getConfiguration('workbench.editor')
-                .update('openSideBySideDirection', 'down', vscode.ConfigurationTarget.Global),
-            ]);
-            await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, title, { viewColumn: vscode.ViewColumn.Beside });
+            await openDiffEditor(leftUri, rightUri, title);
             return;
           }
 
@@ -1217,13 +1238,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 title    = `${newPath} (${shortHash})`;
             }
 
-            await Promise.all([
-              vscode.workspace.getConfiguration('diffEditor')
-                .update('renderSideBySide', true, vscode.ConfigurationTarget.Global),
-              vscode.workspace.getConfiguration('workbench.editor')
-                .update('openSideBySideDirection', 'down', vscode.ConfigurationTarget.Global),
-            ]);
-            await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, title, { viewColumn: vscode.ViewColumn.Beside });
+            await openDiffEditor(leftUri, rightUri, title);
           }
         });
       }
