@@ -1,8 +1,37 @@
 import * as vscode from 'vscode';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+// ─── VS Code Git API (minimal subset of the vscode.git public API) ──────────
+
+interface GitExtension {
+  readonly enabled: boolean;
+  getAPI(version: 1): GitAPI;
+}
+
+interface GitAPI {
+  readonly git: { readonly path: string };
+  getRepository(uri: vscode.Uri): GitRepository | null;
+}
+
+interface GitRef {
+  readonly type: number; // 0 = Head, 1 = RemoteHead, 2 = Tag
+  readonly name?: string;
+}
+
+interface GitRepository {
+  readonly rootUri: vscode.Uri;
+  readonly state: {
+    readonly HEAD: { name?: string } | undefined;
+    readonly refs: GitRef[];
+  };
+  show(ref: string, path: string): Promise<string>;
+  getBranches(query: { remote?: boolean }): Promise<GitRef[]>;
+}
+
+// ─── Domain types ───────────────────────────────────────────────────────────
 
 interface Commit {
   hash: string;
@@ -22,22 +51,35 @@ interface ChangedFile {
 
 // ─── Git helpers ────────────────────────────────────────────────────────────
 
-async function gitBranch(cwd: string): Promise<string> {
-  try {
-    const { stdout } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd });
-    return stdout.trim();
-  } catch {
-    return '(not a git repo)';
-  }
+async function runGit(gitPath: string, cwd: string, args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync(gitPath, args, { cwd });
+  return stdout;
 }
 
-async function gitLog(cwd: string, limit = 50, skip = 0, branch = 'HEAD'): Promise<Commit[]> {
+async function gitBranch(repo: GitRepository | null): Promise<string> {
+  if (!repo) return '(not a git repo)';
+  return repo.state.HEAD?.name ?? '(detached HEAD)';
+}
+
+async function gitBranches(repo: GitRepository | null): Promise<string[]> {
+  if (!repo) return [];
+  try {
+    const refs = await repo.getBranches({ remote: false });
+    const names = refs.map(r => r.name ?? '').filter(Boolean);
+    if (names.length > 0) return names;
+  } catch {}
+  return repo.state.refs
+    .filter(r => r.type === 0)
+    .map(r => r.name ?? '')
+    .filter(Boolean);
+}
+
+async function gitLog(gitPath: string, cwd: string, limit = 50, skip = 0, branch = 'HEAD'): Promise<Commit[]> {
   try {
     const format = '%H\x1f%h\x1f%s\x1f%an\x1f%ad\x1f%ar';
-    const { stdout } = await execAsync(
-      `git log "${branch}" -${limit} --skip=${skip} --date=short --format="${format}"`,
-      { cwd }
-    );
+    const stdout = await runGit(gitPath, cwd, [
+      'log', branch, `-${limit}`, `--skip=${skip}`, '--date=short', `--format=${format}`,
+    ]);
     return stdout
       .trim()
       .split('\n')
@@ -51,29 +93,20 @@ async function gitLog(cwd: string, limit = 50, skip = 0, branch = 'HEAD'): Promi
   }
 }
 
-async function gitBranches(cwd: string): Promise<string[]> {
-  try {
-    const { stdout } = await execAsync('git branch --format="%(refname:short)"', { cwd });
-    return stdout.trim().split('\n').filter(Boolean);
-  } catch {
-    return [];
-  }
-}
-
 async function gitSearchCommits(
+  gitPath: string,
   cwd: string,
   query: string,
   branch: string
 ): Promise<Array<{ hash: string; skip: number }>> {
-  const q = query.replace(/["\\]/g, '\\$&');
-  const run = (cmd: string): Promise<string[]> =>
-    execAsync(cmd, { cwd })
+  const run = (args: string[]): Promise<string[]> =>
+    execFileAsync(gitPath, args, { cwd })
       .then(r => r.stdout.trim().split('\n').filter(Boolean))
       .catch(() => []);
 
   const [byMsg, byAuthor] = await Promise.all([
-    run(`git log "${branch}" -i --grep="${q}" --format="%H"`),
-    run(`git log "${branch}" -i --author="${q}" --format="%H"`),
+    run(['log', branch, '-i', `--grep=${query}`, '--format=%H']),
+    run(['log', branch, '-i', `--author=${query}`, '--format=%H']),
   ]);
 
   const seen = new Set<string>();
@@ -83,21 +116,18 @@ async function gitSearchCommits(
   }
 
   if (/^[0-9a-f]{4,}$/i.test(query)) {
-    try {
-      const { stdout } = await execAsync(`git rev-parse --verify "${query}"`, { cwd });
-      const h = stdout.trim();
-      if (h.length === 40 && !seen.has(h)) { seen.add(h); merged.push(h); }
-    } catch {}
+    const lines = await run(['rev-parse', '--verify', query]);
+    const h = (lines[0] ?? '').trim();
+    if (h.length === 40 && !seen.has(h)) { seen.add(h); merged.push(h); }
   }
 
   if (merged.length === 0) return [];
 
   const results = await Promise.all(
     merged.map(async hash => {
-      try {
-        const { stdout } = await execAsync(`git rev-list --count "${branch}" ^"${hash}"`, { cwd });
-        return { hash, skip: parseInt(stdout.trim(), 10) };
-      } catch { return null; }
+      const lines = await run(['rev-list', '--count', branch, `^${hash}`]);
+      const skip = parseInt(lines[0] ?? '', 10);
+      return isNaN(skip) ? null : { hash, skip };
     })
   );
 
@@ -105,12 +135,11 @@ async function gitSearchCommits(
     .sort((a, b) => a.skip - b.skip);
 }
 
-async function gitFilesChanged(cwd: string, hash: string): Promise<ChangedFile[]> {
+async function gitFilesChanged(gitPath: string, cwd: string, hash: string): Promise<ChangedFile[]> {
   try {
-    const { stdout } = await execAsync(
-      `git diff-tree --no-commit-id -r --name-status ${hash}`,
-      { cwd }
-    );
+    const stdout = await runGit(gitPath, cwd, [
+      'diff-tree', '--no-commit-id', '-r', '--name-status', hash,
+    ]);
     return stdout
       .trim()
       .split('\n')
@@ -137,6 +166,8 @@ async function gitFilesChanged(cwd: string, hash: string): Promise<ChangedFile[]
 class GitShowProvider implements vscode.TextDocumentContentProvider {
   static readonly scheme = 'gitshow';
 
+  constructor(private readonly gitApi: GitAPI) {}
+
   async provideTextDocumentContent(uri: vscode.Uri): Promise<string> {
     const params   = new URLSearchParams(uri.query);
     const ref      = params.get('ref')  ?? '';
@@ -144,8 +175,9 @@ class GitShowProvider implements vscode.TextDocumentContentProvider {
     const cwd      = params.get('cwd')  ?? '';
     if (!ref || !filePath || !cwd) return '';
     try {
-      const { stdout } = await execAsync(`git show "${ref}:${filePath}"`, { cwd });
-      return stdout;
+      const repo = this.gitApi.getRepository(vscode.Uri.file(cwd));
+      if (!repo) return '';
+      return await repo.show(ref, filePath);
     } catch {
       return ''; // initial commit has no parent; added/deleted edge cases
     }
@@ -679,13 +711,24 @@ function escHtml(s: string): string {
 
 // ─── Activation ───────────────────────────────────────────────────────────────
 
-export function activate(context: vscode.ExtensionContext): void {
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  const gitExt = vscode.extensions.getExtension<GitExtension>('vscode.git');
+  if (!gitExt) {
+    vscode.window.showErrorMessage('Git Workspace Explorer requires the built-in VS Code Git extension.');
+    return;
+  }
+  if (!gitExt.isActive) {
+    await gitExt.activate();
+  }
+  const gitApi = gitExt.exports.getAPI(1);
+  const gitPath = gitApi.git.path;
+
   const provider = new WorkspaceFoldersProvider();
 
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider(
       GitShowProvider.scheme,
-      new GitShowProvider()
+      new GitShowProvider(gitApi)
     ),
 
     vscode.window.registerTreeDataProvider('gitWorkspaceExplorer.folders', provider),
@@ -704,10 +747,12 @@ export function activate(context: vscode.ExtensionContext): void {
 
         panel.webview.html = buildWebview(folderName, 'Loading…', [], []);
 
+        const repo = gitApi.getRepository(vscode.Uri.file(folderPath));
+
         const [branch, commits, branches] = await Promise.all([
-          gitBranch(folderPath),
-          gitLog(folderPath),
-          gitBranches(folderPath),
+          gitBranch(repo),
+          gitLog(gitPath, folderPath),
+          gitBranches(repo),
         ]);
 
         panel.webview.html = buildWebview(folderName, branch, commits, branches);
@@ -715,33 +760,33 @@ export function activate(context: vscode.ExtensionContext): void {
         panel.webview.onDidReceiveMessage(async msg => {
           if (msg.type === 'search') {
             const b = msg.branch ?? branch;
-            const results = await gitSearchCommits(folderPath, msg.query, b);
+            const results = await gitSearchCommits(gitPath, folderPath, msg.query, b);
             panel.webview.postMessage({ type: 'searchResults', results, branch: b });
             return;
           }
 
           if (msg.type === 'loadWindow') {
             const b = msg.branch ?? branch;
-            const commits = await gitLog(folderPath, 50, msg.skip, b);
+            const commits = await gitLog(gitPath, folderPath, 50, msg.skip, b);
             panel.webview.postMessage({ type: 'windowCommits', commits, windowSkip: msg.skip, branch: b, anchor: msg.anchor });
             return;
           }
 
           if (msg.type === 'changeBranch') {
-            const commits = await gitLog(folderPath, 50, 0, msg.branch);
+            const commits = await gitLog(gitPath, folderPath, 50, 0, msg.branch);
             panel.webview.postMessage({ type: 'branchCommits', commits, branch: msg.branch });
             return;
           }
 
           if (msg.type === 'loadMore') {
             const b = msg.branch ?? branch;
-            const commits = await gitLog(folderPath, 50, msg.offset, b);
+            const commits = await gitLog(gitPath, folderPath, 50, msg.offset, b);
             panel.webview.postMessage({ type: 'moreCommits', commits, branch: b });
             return;
           }
 
           if (msg.type === 'getFiles') {
-            const files = await gitFilesChanged(folderPath, msg.hash);
+            const files = await gitFilesChanged(gitPath, folderPath, msg.hash);
             panel.webview.postMessage({ type: 'commitFiles', hash: msg.hash, files });
             return;
           }
