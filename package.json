@@ -2,7 +2,7 @@
   "name": "git-workspace-explorer",
   "displayName": "Git Workspace Explorer",
   "description": "Lists top-level workspace folders and shows git branch/commit history",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["SCM Providers"],
   "activationEvents": ["onView:gitWorkspaceExplorer.folders"],
