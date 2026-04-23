@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import * as path from 'path';
 
 const execFileAsync = promisify(execFile);
 
@@ -43,10 +44,15 @@ interface Commit {
 }
 
 interface ChangedFile {
-  status: string;   // A, M, D, R, C
+  status: string;   // A, M, D, R, C, U (untracked, working tree only)
   file: string;     // display label: "path" or "old → new"
   oldPath: string;  // path at parent commit (before)
   newPath: string;  // path at this commit (after)
+}
+
+interface WorkingChanges {
+  staged: ChangedFile[];
+  unstaged: ChangedFile[];
 }
 
 // ─── Git helpers ────────────────────────────────────────────────────────────
@@ -135,27 +141,49 @@ async function gitSearchCommits(
     .sort((a, b) => a.skip - b.skip);
 }
 
+function parseNameStatusLine(line: string): ChangedFile {
+  const parts = line.split('\t');
+  const rawStatus = parts[0].trim();
+  const status = rawStatus[0]; // R100 → R, C090 → C
+  if (status === 'R' || status === 'C') {
+    const oldPath = parts[1] ?? '';
+    const newPath = parts[2] ?? '';
+    return { status, file: `${oldPath} → ${newPath}`, oldPath, newPath };
+  }
+  const p = parts[1] ?? '';
+  return { status, file: p, oldPath: p, newPath: p };
+}
+
+async function gitWorkingChanges(gitPath: string, cwd: string): Promise<WorkingChanges> {
+  const run = async (args: string[]): Promise<string[]> => {
+    try {
+      const { stdout } = await execFileAsync(gitPath, args, { cwd });
+      return stdout.split('\n').filter(Boolean);
+    } catch {
+      return [];
+    }
+  };
+
+  const [stagedLines, unstagedLines, untrackedLines] = await Promise.all([
+    run(['diff', '--cached', '--name-status']),
+    run(['diff', '--name-status']),
+    run(['ls-files', '--others', '--exclude-standard']),
+  ]);
+
+  const staged = stagedLines.map(parseNameStatusLine);
+  const unstaged = unstagedLines.map(parseNameStatusLine);
+  for (const p of untrackedLines) {
+    unstaged.push({ status: 'U', file: p, oldPath: p, newPath: p });
+  }
+  return { staged, unstaged };
+}
+
 async function gitFilesChanged(gitPath: string, cwd: string, hash: string): Promise<ChangedFile[]> {
   try {
     const stdout = await runGit(gitPath, cwd, [
       'diff-tree', '--no-commit-id', '-r', '--name-status', hash,
     ]);
-    return stdout
-      .trim()
-      .split('\n')
-      .filter(Boolean)
-      .map(line => {
-        const parts = line.split('\t');
-        const rawStatus = parts[0].trim();
-        const status = rawStatus[0]; // R100 → R, C090 → C
-        if (status === 'R' || status === 'C') {
-          const oldPath = parts[1] ?? '';
-          const newPath = parts[2] ?? '';
-          return { status, file: `${oldPath} → ${newPath}`, oldPath, newPath };
-        }
-        const p = parts[1] ?? '';
-        return { status, file: p, oldPath: p, newPath: p };
-      });
+    return stdout.trim().split('\n').filter(Boolean).map(parseNameStatusLine);
   } catch {
     return [];
   }
@@ -166,15 +194,21 @@ async function gitFilesChanged(gitPath: string, cwd: string, hash: string): Prom
 class GitShowProvider implements vscode.TextDocumentContentProvider {
   static readonly scheme = 'gitshow';
 
-  constructor(private readonly gitApi: GitAPI) {}
+  constructor(private readonly gitApi: GitAPI, private readonly gitPath: string) {}
 
   async provideTextDocumentContent(uri: vscode.Uri): Promise<string> {
     const params   = new URLSearchParams(uri.query);
-    const ref      = params.get('ref')  ?? '';
+    const ref      = params.get('ref');
     const filePath = params.get('file') ?? '';
     const cwd      = params.get('cwd')  ?? '';
-    if (!ref || !filePath || !cwd) return '';
+    if (ref === null || !filePath || !cwd) return '';
     try {
+      if (ref === '') {
+        // Index version (stage 0): git show :path. VS Code API's repo.show
+        // may not accept an empty ref, so call git directly for this case.
+        const { stdout } = await execFileAsync(this.gitPath, ['show', `:${filePath}`], { cwd });
+        return stdout;
+      }
       const repo = this.gitApi.getRepository(vscode.Uri.file(cwd));
       if (!repo) return '';
       return await repo.show(ref, filePath);
@@ -186,9 +220,12 @@ class GitShowProvider implements vscode.TextDocumentContentProvider {
 
 function makeGitShowUri(ref: string, filePath: string, cwd: string): vscode.Uri {
   const safePath = filePath.replace(/\//g, '%2F');
+  const refSegment = ref === '' ? 'INDEX' : ref;
   const query = `ref=${encodeURIComponent(ref)}&file=${encodeURIComponent(filePath)}&cwd=${encodeURIComponent(cwd)}`;
-  return vscode.Uri.from({ scheme: GitShowProvider.scheme, path: `/${ref}/${safePath}`, query });
+  return vscode.Uri.from({ scheme: GitShowProvider.scheme, path: `/${refSegment}/${safePath}`, query });
 }
+
+const INDEX_REF = '';
 
 const EMPTY_URI = vscode.Uri.from({ scheme: GitShowProvider.scheme, path: '/empty' });
 
@@ -235,7 +272,13 @@ class WorkspaceFoldersProvider implements vscode.TreeDataProvider<FolderItem> {
 
 // ─── Webview ─────────────────────────────────────────────────────────────────
 
-function buildWebview(folderName: string, branch: string, commits: Commit[], branches: string[]): string {
+function buildWebview(
+  folderName: string,
+  branch: string,
+  commits: Commit[],
+  branches: string[],
+  working: WorkingChanges
+): string {
   const commitRows = commits.length === 0
     ? '<tr><td colspan="5" class="empty">No commits found</td></tr>'
     : commits.map(c => `
@@ -366,7 +409,105 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
     .s-D { color: #f85149; }
     .s-R { color: #58a6ff; }
     .s-C { color: #bc8cff; }
+    .s-U { color: #3fb950; }
+
+    /* working tree rows */
+    .working-row .working-dot { font-size: 0.8em; }
+    .working-row[data-kind="unstaged"] .working-dot { color: #d29922; }
+    .working-row[data-kind="staged"]   .working-dot { color: #3fb950; }
+    .working-row .subject { font-weight: 500; }
+    .working-row .count { opacity: 0.7; font-weight: normal; margin-left: 4px; }
+    .working-row .count.empty { opacity: 0.4; font-style: italic; }
+    .working-row .date { font-style: italic; opacity: 0.55; }
     .file-name { opacity: 0.9; }
+    .stage-btn {
+      background: none;
+      border: 1px solid transparent;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 0.95em;
+      font-weight: 700;
+      line-height: 1;
+      padding: 0 3px;
+      color: inherit;
+      opacity: 0.55;
+      flex-shrink: 0;
+    }
+    .stage-btn:hover { opacity: 1; border-color: currentColor; }
+    .stage-btn.add    { color: #3fb950; }
+    .stage-btn.remove { color: #f85149; }
+    .commit-open-btn {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      border: none;
+      border-radius: 3px;
+      padding: 2px 8px;
+      font-family: inherit;
+      font-size: 0.82em;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .commit-open-btn:hover { background: var(--vscode-button-secondaryHoverBackground); }
+    .commit-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.45);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 20;
+    }
+    .commit-overlay.hidden { display: none; }
+    .commit-dialog {
+      background: var(--vscode-editor-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 6px;
+      padding: 16px;
+      width: min(420px, 92vw);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.35);
+    }
+    .commit-dialog h3 { margin: 0; font-size: 1em; opacity: 0.85; }
+    .commit-dialog textarea {
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      border: 1px solid var(--vscode-input-border, rgba(128,128,128,0.4));
+      border-radius: 4px;
+      padding: 6px 8px;
+      font-family: inherit;
+      font-size: 0.92em;
+      resize: vertical;
+      outline: none;
+      min-height: 80px;
+    }
+    .commit-dialog textarea:focus { border-color: var(--vscode-focusBorder); }
+    .commit-dialog-hint { font-size: 0.78em; opacity: 0.5; margin: 0; }
+    .commit-dialog-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    .commit-dialog-actions button {
+      padding: 5px 16px;
+      border: none;
+      border-radius: 3px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.9em;
+    }
+    .commit-dialog-actions .btn-primary {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+    }
+    .commit-dialog-actions .btn-primary:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+    .commit-dialog-actions .btn-primary:disabled { opacity: 0.45; cursor: default; }
+    .commit-dialog-actions .btn-secondary {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+    }
+    .commit-dialog-actions .btn-secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
     .no-files { opacity: 0.5; font-style: italic; }
 
     .search-bar {
@@ -433,7 +574,8 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
         <th style="text-align:right">Date</th>
       </tr>
     </thead>
-    <tbody>
+    <tbody id="commit-tbody">
+      <!-- working rows injected here by JS so every tbody re-render goes through one path -->
       ${commitRows}
       ${commits.length === 50 ? '<tr id="load-sentinel"><td colspan="5" style="text-align:center;padding:14px;opacity:0.45;font-style:italic">Loading more…</td></tr>' : ''}
     </tbody>
@@ -445,6 +587,18 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
     <button id="search-prev" title="Previous match" disabled>↑</button>
     <button id="search-next" title="Next match" disabled>↓</button>
     <span class="search-count" id="search-count"></span>
+  </div>
+
+  <div id="commit-overlay" class="commit-overlay hidden">
+    <div class="commit-dialog">
+      <h3>Commit staged changes</h3>
+      <textarea id="commit-msg-input" placeholder="Commit message (required)&#10;&#10;Ctrl+Enter to commit"></textarea>
+      <p class="commit-dialog-hint">Ctrl+Enter to commit · Esc to cancel</p>
+      <div class="commit-dialog-actions">
+        <button id="commit-cancel-btn" class="btn-secondary">Cancel</button>
+        <button id="commit-do-btn"     class="btn-primary" disabled>Commit</button>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -459,6 +613,7 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
     let sentinelObserver = null;
     let searchResults = [];
     let searchResultIdx = -1;
+    let workingChanges = ${JSON.stringify(working)};
 
     function esc(s) {
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -473,6 +628,60 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
         '<td class="date" title="' + esc(c.date) + '">' + esc(c.relativeDate) + '</td>' +
         '</tr>';
     }
+
+    function renderWorkingRow(kind, label) {
+      const files = workingChanges[kind] || [];
+      const n = files.length;
+      const countHtml = n > 0
+        ? '<span class="count">(' + n + ' file' + (n === 1 ? '' : 's') + ')</span>'
+        : '<span class="count empty">(no changes)</span>';
+      const dateCell = kind === 'staged'
+        ? '<button class="commit-open-btn">Commit…</button>'
+        : 'Working tree';
+      return '<tr class="commit-row working-row" data-hash="__' + kind + '__" data-kind="' + kind + '">' +
+        '<td class="arrow">▶</td>' +
+        '<td class="hash"><span class="working-dot">●</span></td>' +
+        '<td class="subject">' + label + ' ' + countHtml + '</td>' +
+        '<td class="author"></td>' +
+        '<td class="date">' + dateCell + '</td>' +
+      '</tr>';
+    }
+
+    function renderWorkingRowsHtml() {
+      return renderWorkingRow('unstaged', 'Unstaged Changes') +
+             renderWorkingRow('staged',   'Staged Changes');
+    }
+
+    function renderFileEntries(hash, files, kind) {
+      if (files.length === 0) {
+        return '<span class="no-files">' + (kind ? 'No changes' : 'No files changed') + '</span>';
+      }
+      const kindAttr = kind ? ' data-kind="' + esc(kind) + '"' : '';
+      const btnHtml = kind === 'unstaged'
+        ? '<button class="stage-btn add" title="Stage file">+</button>'
+        : kind === 'staged'
+        ? '<button class="stage-btn remove" title="Unstage file">−</button>'
+        : '';
+      return files.map(f =>
+        '<span class="file-entry"' +
+          ' data-hash="'     + esc(hash)        + '"' +
+          kindAttr +
+          ' data-status="'   + esc(f.status)    + '"' +
+          ' data-old-path="' + esc(f.oldPath)   + '"' +
+          ' data-new-path="' + esc(f.newPath)   + '"' +
+        '>' +
+          btnHtml +
+          '<span class="file-status s-' + esc(f.status) + '">' + esc(f.status) + '</span>' +
+          '<span class="file-name">' + esc(f.file) + '</span>' +
+        '</span>'
+      ).join('');
+    }
+
+    // Inject working rows at the top of the initial tbody
+    (function(){
+      const tbody = document.getElementById('commit-tbody');
+      tbody.insertAdjacentHTML('afterbegin', renderWorkingRowsHtml());
+    })();
 
     function attachSentinelObserver() {
       if (sentinelObserver) sentinelObserver.disconnect();
@@ -505,7 +714,8 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
       pending.clear();
       clearSearch();
       const tbody = document.querySelector('tbody');
-      tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:14px;opacity:0.5;font-style:italic">Loading…</td></tr>';
+      tbody.innerHTML = renderWorkingRowsHtml() +
+        '<tr><td colspan="5" style="text-align:center;padding:14px;opacity:0.5;font-style:italic">Loading…</td></tr>';
       vscode.postMessage({ type: 'changeBranch', branch: viewBranch });
     });
 
@@ -515,12 +725,19 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
     });
 
     document.addEventListener('click', e => {
-      const fileEntry = e.target.closest('.file-entry');
-      if (fileEntry) {
+      if (e.target.closest('.commit-open-btn')) {
         e.stopPropagation();
+        openCommitDialog();
+        return;
+      }
+
+      const stageBtn = e.target.closest('.stage-btn');
+      if (stageBtn) {
+        e.stopPropagation();
+        const fileEntry = stageBtn.closest('.file-entry');
+        const kind = fileEntry.dataset.kind;
         vscode.postMessage({
-          type:    'openDiff',
-          hash:    fileEntry.dataset.hash,
+          type:    kind === 'unstaged' ? 'stageFile' : 'unstageFile',
           status:  fileEntry.dataset.status,
           oldPath: fileEntry.dataset.oldPath,
           newPath: fileEntry.dataset.newPath,
@@ -528,10 +745,35 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
         return;
       }
 
+      const fileEntry = e.target.closest('.file-entry');
+      if (fileEntry) {
+        e.stopPropagation();
+        const kind = fileEntry.dataset.kind;
+        if (kind === 'unstaged' || kind === 'staged') {
+          vscode.postMessage({
+            type:    'openWorkingDiff',
+            kind,
+            status:  fileEntry.dataset.status,
+            oldPath: fileEntry.dataset.oldPath,
+            newPath: fileEntry.dataset.newPath,
+          });
+        } else {
+          vscode.postMessage({
+            type:    'openDiff',
+            hash:    fileEntry.dataset.hash,
+            status:  fileEntry.dataset.status,
+            oldPath: fileEntry.dataset.oldPath,
+            newPath: fileEntry.dataset.newPath,
+          });
+        }
+        return;
+      }
+
       const row = e.target.closest('tr.commit-row');
       if (!row) return;
 
       const hash = row.dataset.hash;
+      const kind = row.dataset.kind; // set on working rows only
       const detailId = 'detail-' + hash;
       const existing = document.getElementById(detailId);
 
@@ -550,21 +792,35 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
       }
 
       if (pending.has(hash)) return;
-      pending.add(hash);
       row.classList.add('expanded');
       expandedHash = hash;
 
       const loadRow = document.createElement('tr');
       loadRow.id = detailId;
       loadRow.className = 'detail-row';
-      loadRow.innerHTML = '<td colspan="5"><div class="file-list loading">Loading…</div></td>';
-      row.insertAdjacentElement('afterend', loadRow);
 
-      vscode.postMessage({ type: 'getFiles', hash });
+      if (kind) {
+        // Working row — files already known locally, render immediately
+        const files = workingChanges[kind] || [];
+        loadRow.innerHTML = '<td colspan="5"><div class="file-list">' +
+          renderFileEntries(hash, files, kind) + '</div></td>';
+        row.insertAdjacentElement('afterend', loadRow);
+      } else {
+        pending.add(hash);
+        loadRow.innerHTML = '<td colspan="5"><div class="file-list loading">Loading…</div></td>';
+        row.insertAdjacentElement('afterend', loadRow);
+        vscode.postMessage({ type: 'getFiles', hash });
+      }
     });
 
     window.addEventListener('message', e => {
       const { type, hash, files, commits: batch } = e.data;
+
+      if (type === 'commitDone') {
+        closeCommitDialog();
+        commitDoBtn.textContent = 'Commit';
+        return;
+      }
 
       if (type === 'searchResults') {
         if (e.data.branch !== viewBranch) return;
@@ -583,7 +839,7 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
         offset = windowSkip + (batch?.length ?? 0);
         exhausted = (batch?.length ?? 0) < 50;
         const sentinelHtml = exhausted ? '' : '<tr id="load-sentinel"><td colspan="5" style="text-align:center;padding:14px;opacity:0.45;font-style:italic">Loading more…</td></tr>';
-        tbody.innerHTML = (batch ?? []).map(renderRow).join('') + sentinelHtml;
+        tbody.innerHTML = renderWorkingRowsHtml() + (batch ?? []).map(renderRow).join('') + sentinelHtml;
         if (!exhausted) attachSentinelObserver();
         const anchorRow = document.querySelector('tr.commit-row[data-hash="' + esc(anchor) + '"]');
         if (anchorRow) {
@@ -598,13 +854,14 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
         const tbody = document.querySelector('tbody');
         if (!batch || batch.length === 0) {
           exhausted = true;
-          tbody.innerHTML = '<tr><td colspan="5" class="empty">No commits found</td></tr>';
+          tbody.innerHTML = renderWorkingRowsHtml() +
+            '<tr><td colspan="5" class="empty">No commits found</td></tr>';
           return;
         }
         offset = batch.length;
         exhausted = batch.length < 50;
         const sentinelHtml = exhausted ? '' : '<tr id="load-sentinel"><td colspan="5" style="text-align:center;padding:14px;opacity:0.45;font-style:italic">Loading more…</td></tr>';
-        tbody.innerHTML = batch.map(renderRow).join('') + sentinelHtml;
+        tbody.innerHTML = renderWorkingRowsHtml() + batch.map(renderRow).join('') + sentinelHtml;
         if (!exhausted) attachSentinelObserver();
         return;
       }
@@ -627,6 +884,26 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
         return;
       }
 
+      if (type === 'workingChanges') {
+        workingChanges = e.data.working;
+        for (const k of ['unstaged', 'staged']) {
+          const row = document.querySelector('tr.working-row[data-kind="' + k + '"]');
+          if (!row) continue;
+          const n = (workingChanges[k] || []).length;
+          const label = k === 'unstaged' ? 'Unstaged Changes' : 'Staged Changes';
+          const countHtml = n > 0
+            ? '<span class="count">(' + n + ' file' + (n === 1 ? '' : 's') + ')</span>'
+            : '<span class="count empty">(no changes)</span>';
+          row.querySelector('.subject').innerHTML = label + ' ' + countHtml;
+          const detailRow = document.getElementById('detail-__' + k + '__');
+          if (detailRow) {
+            detailRow.querySelector('.file-list').innerHTML =
+              renderFileEntries('__' + k + '__', workingChanges[k] || [], k);
+          }
+        }
+        return;
+      }
+
       if (type !== 'commitFiles') return;
       pending.delete(hash);
 
@@ -634,22 +911,8 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
       if (!detailRow) return;
 
       const fileList = detailRow.querySelector('.file-list');
-      if (files.length === 0) {
-        fileList.innerHTML = '<span class="no-files">No files changed</span>';
-        return;
-      }
       fileList.classList.remove('loading');
-      fileList.innerHTML = files.map(f =>
-        '<span class="file-entry"' +
-          ' data-hash="'     + esc(hash)        + '"' +
-          ' data-status="'   + esc(f.status)    + '"' +
-          ' data-old-path="' + esc(f.oldPath)   + '"' +
-          ' data-new-path="' + esc(f.newPath)   + '"' +
-        '>' +
-          '<span class="file-status s-' + esc(f.status) + '">' + esc(f.status) + '</span>' +
-          '<span class="file-name">' + esc(f.file) + '</span>' +
-        '</span>'
-      ).join('');
+      fileList.innerHTML = renderFileEntries(hash, files, null);
     });
 
     const searchInput = document.getElementById('search-input');
@@ -696,6 +959,50 @@ function buildWebview(folderName: string, branch: string, commits: Commit[], bra
     searchInput.addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
     searchPrev.addEventListener('click', () => goToMatch(searchResultIdx - 1));
     searchNext.addEventListener('click', () => goToMatch(searchResultIdx + 1));
+
+    // ── Commit dialog ──────────────────────────────────────────────────────
+    const commitOverlay  = document.getElementById('commit-overlay');
+    const commitMsgInput = document.getElementById('commit-msg-input');
+    const commitDoBtn    = document.getElementById('commit-do-btn');
+    const commitCancelBtn= document.getElementById('commit-cancel-btn');
+
+    function openCommitDialog() {
+      commitMsgInput.value = '';
+      commitDoBtn.disabled = true;
+      commitOverlay.classList.remove('hidden');
+      commitMsgInput.focus();
+    }
+
+    function closeCommitDialog() {
+      commitOverlay.classList.add('hidden');
+    }
+
+    commitMsgInput.addEventListener('input', () => {
+      commitDoBtn.disabled = commitMsgInput.value.trim() === '';
+    });
+
+    commitMsgInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        if (!commitDoBtn.disabled) commitDoBtn.click();
+      }
+      if (e.key === 'Escape') closeCommitDialog();
+    });
+
+    commitCancelBtn.addEventListener('click', closeCommitDialog);
+
+    commitOverlay.addEventListener('click', e => {
+      if (e.target === commitOverlay) closeCommitDialog();
+    });
+
+    commitDoBtn.addEventListener('click', () => {
+      const msg = commitMsgInput.value.trim();
+      if (!msg) return;
+      commitDoBtn.disabled = true;
+      commitDoBtn.textContent = 'Committing…';
+      vscode.postMessage({ type: 'commitStaged', message: msg });
+    });
+
   </script>
 </body>
 </html>`;
@@ -728,7 +1035,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider(
       GitShowProvider.scheme,
-      new GitShowProvider(gitApi)
+      new GitShowProvider(gitApi, gitPath)
     ),
 
     vscode.window.registerTreeDataProvider('gitWorkspaceExplorer.folders', provider),
@@ -745,17 +1052,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           { enableScripts: true, retainContextWhenHidden: true }
         );
 
-        panel.webview.html = buildWebview(folderName, 'Loading…', [], []);
+        panel.webview.html = buildWebview(folderName, 'Loading…', [], [], { staged: [], unstaged: [] });
 
         const repo = gitApi.getRepository(vscode.Uri.file(folderPath));
 
-        const [branch, commits, branches] = await Promise.all([
+        const [branch, commits, branches, working] = await Promise.all([
           gitBranch(repo),
           gitLog(gitPath, folderPath),
           gitBranches(repo),
+          gitWorkingChanges(gitPath, folderPath),
         ]);
 
-        panel.webview.html = buildWebview(folderName, branch, commits, branches);
+        panel.webview.html = buildWebview(folderName, branch, commits, branches, working);
 
         panel.webview.onDidReceiveMessage(async msg => {
           if (msg.type === 'search') {
@@ -788,6 +1096,93 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           if (msg.type === 'getFiles') {
             const files = await gitFilesChanged(gitPath, folderPath, msg.hash);
             panel.webview.postMessage({ type: 'commitFiles', hash: msg.hash, files });
+            return;
+          }
+
+          if (msg.type === 'stageFile') {
+            const { status, oldPath, newPath } = msg as { status: string; oldPath: string; newPath: string };
+            try {
+              // For deletions the file is gone; git add still records the removal.
+              await runGit(gitPath, folderPath, ['add', '--', status === 'D' ? oldPath : newPath]);
+            } catch {}
+            const working = await gitWorkingChanges(gitPath, folderPath);
+            panel.webview.postMessage({ type: 'workingChanges', working });
+            return;
+          }
+
+          if (msg.type === 'unstageFile') {
+            const { status, oldPath, newPath } = msg as { status: string; oldPath: string; newPath: string };
+            try {
+              const paths = (status === 'R' || status === 'C') ? [oldPath, newPath] : [newPath];
+              await runGit(gitPath, folderPath, ['restore', '--staged', '--', ...paths]);
+            } catch {}
+            const working = await gitWorkingChanges(gitPath, folderPath);
+            panel.webview.postMessage({ type: 'workingChanges', working });
+            return;
+          }
+
+          if (msg.type === 'commitStaged') {
+            try {
+              await runGit(gitPath, folderPath, ['commit', '-m', msg.message as string]);
+            } catch {}
+            panel.webview.postMessage({ type: 'commitDone' });
+            const working = await gitWorkingChanges(gitPath, folderPath);
+            panel.webview.postMessage({ type: 'workingChanges', working });
+            return;
+          }
+
+          if (msg.type === 'openWorkingDiff') {
+            const { kind, status, oldPath, newPath } = msg as {
+              kind: 'unstaged' | 'staged'; status: string; oldPath: string; newPath: string;
+            };
+            const workingUri = (p: string) => vscode.Uri.file(path.join(folderPath, p));
+            let leftUri: vscode.Uri;
+            let rightUri: vscode.Uri;
+            let title: string;
+
+            if (kind === 'unstaged') {
+              // HEAD → working tree
+              if (status === 'U') {
+                leftUri  = EMPTY_URI;
+                rightUri = workingUri(newPath);
+                title    = `${newPath} (untracked)`;
+              } else if (status === 'D') {
+                leftUri  = makeGitShowUri('HEAD', oldPath, folderPath);
+                rightUri = EMPTY_URI;
+                title    = `${oldPath} (deleted, unstaged)`;
+              } else {
+                leftUri  = makeGitShowUri('HEAD', newPath, folderPath);
+                rightUri = workingUri(newPath);
+                title    = `${newPath} (unstaged)`;
+              }
+            } else {
+              // HEAD → index
+              if (status === 'A') {
+                leftUri  = EMPTY_URI;
+                rightUri = makeGitShowUri(INDEX_REF, newPath, folderPath);
+                title    = `${newPath} (added, staged)`;
+              } else if (status === 'D') {
+                leftUri  = makeGitShowUri('HEAD', oldPath, folderPath);
+                rightUri = EMPTY_URI;
+                title    = `${oldPath} (deleted, staged)`;
+              } else if (status === 'R') {
+                leftUri  = makeGitShowUri('HEAD', oldPath, folderPath);
+                rightUri = makeGitShowUri(INDEX_REF, newPath, folderPath);
+                title    = `${oldPath} → ${newPath} (renamed, staged)`;
+              } else {
+                leftUri  = makeGitShowUri('HEAD', newPath, folderPath);
+                rightUri = makeGitShowUri(INDEX_REF, newPath, folderPath);
+                title    = `${newPath} (staged)`;
+              }
+            }
+
+            await Promise.all([
+              vscode.workspace.getConfiguration('diffEditor')
+                .update('renderSideBySide', true, vscode.ConfigurationTarget.Global),
+              vscode.workspace.getConfiguration('workbench.editor')
+                .update('openSideBySideDirection', 'down', vscode.ConfigurationTarget.Global),
+            ]);
+            await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, title, { viewColumn: vscode.ViewColumn.Beside });
             return;
           }
 
